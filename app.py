@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 import fitz  # PyMuPDF
 import requests
@@ -6,6 +6,7 @@ import json
 from pydantic import BaseModel
 import os
 from dotenv import load_dotenv
+from uuid import uuid4
 
 # Load environment variables
 load_dotenv()
@@ -21,7 +22,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 DOMO_DEVELOPER_TOKEN = os.getenv("DOMO_DEVELOPER_TOKEN")
 API_URL = "https://gwcteq-partner.domo.com/api/ai/v1/text/generation"
 
@@ -30,6 +30,7 @@ if not DOMO_DEVELOPER_TOKEN:
 
 class Query(BaseModel):
     question: str
+    session_id: str  # Identify which PDF this question relates to
 
 def extract_text_from_pdf(file_bytes: bytes) -> str:
     """Extracts text from a PDF file given its byte content."""
@@ -65,34 +66,33 @@ def query_domo_api(question: str, context: str) -> str:
     except requests.exceptions.RequestException as e:
         raise HTTPException(status_code=500, detail=f"Error calling Domo API: {str(e)}")
 
-# Store PDF text in memory (consider a database for production)
-pdf_content = ""
+# Store PDF text in memory (Use Redis/DB for production)
+pdf_storage = {}
 
 @app.post("/upload-pdf/")
 async def upload_pdf(file: UploadFile = File(...)):
-    """Uploads a PDF and extracts text."""
-    global pdf_content
+    """Uploads a PDF and extracts text, returning a session ID."""
     if not file.filename.endswith('.pdf'):
         raise HTTPException(status_code=400, detail="File must be a PDF")
     
-    contents = await file.read()  # Read file only once
-    pdf_content = extract_text_from_pdf(contents)
+    contents = await file.read()
+    extracted_text = extract_text_from_pdf(contents)
+
+    # Generate a unique session ID
+    session_id = str(uuid4())  
+    pdf_storage[session_id] = extracted_text  # Store extracted text
     
-    return {"message": "PDF processed successfully", "text_length": len(pdf_content)}
+    return {"message": "PDF processed successfully", "session_id": session_id, "text_length": len(extracted_text)}
 
 @app.post("/ask-question/")
 async def ask_question(query: Query):
     """Handles question answering based on the uploaded PDF content."""
-    if not pdf_content:
-        raise HTTPException(status_code=400, detail="Please upload a PDF first")
+    if query.session_id not in pdf_storage:
+        raise HTTPException(status_code=400, detail="Invalid session ID. Please upload a PDF first.")
     
-    response = query_domo_api(query.question, pdf_content)
+    response = query_domo_api(query.question, pdf_storage[query.session_id])
     return {"answer": response}
 
 @app.get("/")
 async def root():
     return {"message": "Welcome to PDF Analysis API. Use /upload-pdf/ to upload a PDF and /ask-question/ to ask questions about it."}
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
